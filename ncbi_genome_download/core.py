@@ -4,12 +4,14 @@ import hashlib
 import logging
 import os
 import sys
+import time
 from collections import namedtuple
 from enum import Enum, unique
 from io import StringIO
 from multiprocessing import Pool
 
 import requests
+import ncbitax
 
 from .summary import SummaryReader
 
@@ -218,28 +220,33 @@ def download(**kwargs):
     assert len(kwargs) == 0, "Unrecognized option(s): {}".format(kwargs.keys())
 
     # Actual logic
-    try:
-        download_jobs = []
+
+    def download_jobs_groups():
         for group in groups:
-            download_jobs.extend(
-                _download(section, group, uri, output, file_format, assembly_level, genus,
-                          species_taxid, taxid, human_readable, refseq_category))
+            for job in _download(section, group, uri, output, file_format, assembly_level, genus,
+                                species_taxid, taxid, human_readable, refseq_category):
+                yield job
 
-        pool = Pool(processes=parallel)
-        jobs = pool.map_async(worker, download_jobs)
+    if parallel == 1:
+        for job in download_jobs_groups():
+            worker(job)
+    else:
         try:
-            # 0xFFFF is just "a really long time"
-            jobs.get(0xFFFF)
-        except KeyboardInterrupt:  # pragma: no cover
-            # TODO: Actually test this once I figure out how to do this in py.test
-            logging.error("Interrupted by user")
-            return 1
+            pool = Pool(processes=parallel)
+            jobs = pool.map_async(worker, download_jobs)
+            try:
+                # 0xFFFF is just "a really long time"
+                jobs.get(0xFFFF)
+            except KeyboardInterrupt:  # pragma: no cover
+                # TODO: Actually test this once I figure out how to do this in py.test
+                logging.error("Interrupted by user")
+                return 1
 
+        except requests.exceptions.ConnectionError as err:
+            logging.error('Download from NCBI failed: %r', err)
+            # Exit code 75 meas TEMPFAIL in C/C++, so let's stick with that for now.
+            return 75
 
-    except requests.exceptions.ConnectionError as err:
-        logging.error('Download from NCBI failed: %r', err)
-        # Exit code 75 meas TEMPFAIL in C/C++, so let's stick with that for now.
-        return 75
     return 0
 # pylint: enable=too-many-locals
 
@@ -274,7 +281,6 @@ def _download(section, group, uri, output, file_format, assembly_level, genus, s
     """
     summary_file = get_summary(section, group, uri)
     entries = parse_summary(summary_file)
-    download_jobs = []
     for entry in entries:
         if genus is not None and not entry['organism_name'].startswith(
                 genus.capitalize()):
@@ -296,9 +302,8 @@ def _download(section, group, uri, output, file_format, assembly_level, genus, s
         if refseq_category != 'all' and entry['refseq_category'] != ERefseqCategories.get_content(refseq_category):
             logging.debug('Skipping entry with refseq_category %r, not %r', entry['refseq_category'], refseq_category)
             continue
-        download_jobs.extend(
-            download_entry(entry, section, group, output, file_format, human_readable))
-    return download_jobs
+        for x in download_entry(entry, section, group, output, file_format, human_readable):
+            yield x
 # pylint: enable=too-many-arguments
 
 
@@ -311,6 +316,7 @@ def worker(job):
             ret = save_and_check(req, job.local_file, job.expected_checksum)
             if not ret:
                 return ret
+        logging.debug('Creating symlink %s -> %s', job.symlink_path, job.local_file)
         ret = create_symlink(job.local_file, job.symlink_path)
     except KeyboardInterrupt:  # pragma: no cover
         # TODO: Actually test this once I figure out how to do this in py.test
@@ -344,10 +350,19 @@ def download_entry(entry, section, domain, output, file_format, human_readable):
     if human_readable:
         symlink_path = create_readable_dir(entry, section, domain, output)
 
+
+        species_taxid_path = os.path.join(output, 'species_taxid', entry['species_taxid'],
+                                          get_strain_label(entry))
+        mkdir_p(species_taxid_path)
+
+    start_time = time.time()
     checksums = grab_checksums_file(entry)
+    end_time = time.time()
+    logging.info('Download checksums took {}'.format(end_time-start_time))
 
     # TODO: Only write this when the checksums file changed
-    with open(os.path.join(full_output_dir, 'MD5SUMS'), 'w') as handle:
+    checksums_path = os.path.join(full_output_dir, 'MD5SUMS')
+    with open(checksums_path, 'w') as handle:
         handle.write(checksums)
 
     parsed_checksums = parse_checksums(checksums)
@@ -357,33 +372,35 @@ def download_entry(entry, section, domain, output, file_format, human_readable):
     else:
         formats = [file_format]
 
-    download_jobs = []
     for fmt in formats:
         try:
             if has_file_changed(full_output_dir, parsed_checksums, fmt):
-                download_jobs.append(
-                    download_file_job(entry, full_output_dir, parsed_checksums, fmt, symlink_path))
+                yield download_file_job(entry, full_output_dir, parsed_checksums, fmt, symlink_path)
             elif need_to_create_symlink(full_output_dir, parsed_checksums, fmt, symlink_path):
-                download_jobs.append(
-                    create_symlink_job(full_output_dir, parsed_checksums, fmt, symlink_path))
+                yield create_symlink_job(full_output_dir, parsed_checksums, fmt, symlink_path)
+            elif need_to_create_symlink(full_output_dir, parsed_checksums, fmt, species_taxid_path):
+                yield create_symlink_job(full_output_dir, parsed_checksums, fmt, species_taxid_path)
         except ValueError as err:
             logging.error(err)
 
-    return download_jobs
 # pylint: enable=too-many-arguments
+
+def mkdir_p(path):
+    if os.path.isdir(path):
+        return
+    try:
+        os.makedirs(path)
+    except OSError as err:
+        if err.errno == errno.EEXIST and os.path.isdir(path):
+            pass
+        else:
+            raise
 
 
 def create_dir(entry, section, domain, output):
     """Create the output directory for the entry if needed"""
     full_output_dir = os.path.join(output, section, domain, entry['assembly_accession'])
-    try:
-        os.makedirs(full_output_dir)
-    except OSError as err:
-        if err.errno == errno.EEXIST and os.path.isdir(full_output_dir):
-            pass
-        else:
-            raise
-
+    mkdir_p(full_output_dir)
     return full_output_dir
 
 
@@ -399,14 +416,7 @@ def create_readable_dir(entry, section, domain, output):
                                        entry['organism_name'].replace(' ', '_'),
                                        get_strain_label(entry, viral=True))
 
-    try:
-        os.makedirs(full_output_dir)
-    except OSError as err:
-        if err.errno == errno.EEXIST and os.path.isdir(full_output_dir):
-            pass
-        else:
-            raise
-
+    mkdir_p(full_output_dir)
     return full_output_dir
 
 
